@@ -1,10 +1,37 @@
 import { findExternalToolByName } from './registry.js';
 
+/**
+ * MiMo models output tool calls in THREE different formats.
+ * Parser MUST handle all three.
+ *
+ * Format 1: <function_calls>{JSON}</function_calls>
+ * Format 2:  IMD output...
+ *            {JSON}
+ *             IMD output...
+ * Format 3: <function=NAME><parameter=key>val</parameter></function>
+ */
+
+const TOOL_TAGS = ['<function_calls>', ' IMM output...'];
+const CLOSE_TAGS = ['</function_calls>', ' IMD output...'];
+const MAX_BUFFER = 8192;
+
+const FUNC_EQ_REGEX = /<function=(\w+)>([\s\S]*?)<\/function>/g;
+const PARAM_REGEX = /<parameter=(\w+)>([\s\S]*?)<\/parameter>/g;
+
+/**
+ * Strip ALL tool call markup from text.
+ * Handles all 3 MiMo formats.
+ */
 export function stripFunctionCallMarkup(text, trim = true) {
   if (!text) return text;
   const cleaned = text
+    // Format 1: <function_calls>...</function_calls>
     .replace(/<function_calls>[\s\S]*?<\/function_calls>/g, '')
     .replace(/<\/?function_calls>/g, '')
+    // Format 2:  IMD output...
+    .replace(/ IMD output...[\s\S]*? IMD output.../g, '')
+    .replace(/ IMD output.../g, '')
+    // Format 3: <function=NAME>...</function>
     .replace(/<function=\w+>[\s\S]*?<\/function>/g, '')
     .replace(/<parameter=\w+>[\s\S]*?<\/parameter>/g, '')
     .replace(/<tool_name>[\s\S]*?<\/tool_name>/g, '')
@@ -14,26 +41,79 @@ export function stripFunctionCallMarkup(text, trim = true) {
 }
 
 /**
+ * Strip tool markup from a single delta chunk (for streaming).
+ * Same logic as stripFunctionCallMarkup but for per-delta use.
+ */
+export function stripToolMarkup(text) {
+  if (!text) return text;
+  return stripFunctionCallMarkup(text, false);
+}
+
+/**
+ * Strip all formats from final text (for non-streaming).
+ */
+export function stripToolMarkupText(text) {
+  if (!text) return text;
+  return stripFunctionCallMarkup(text, true);
+}
+
+/**
+ * Parse  IMD output... JSON blocks
+ */
+function parseAntmlBlocks(...chunks) {
+  const matches = [];
+  chunks.forEach((chunk) => {
+    if (!chunk || typeof chunk !== 'string') return;
+    // Match  IMD output...\n{JSON}\n IMD output...
+    const blocks = chunk.matchAll(/ IMD output...[\s\S]*? IMD output.../g);
+    for (const block of blocks) {
+      const raw = block[0];
+      // Extract JSON between the tags
+      const jsonStr = raw.replace(/^ IMD output.../, '').replace(/ IMD output...$/, '').trim();
+      if (!jsonStr) continue;
+      try {
+        const parsed = JSON.parse(jsonStr);
+        const rawCalls = Array.isArray(parsed) ? parsed : [parsed];
+        rawCalls.forEach((rawCall, index) => {
+          const name = rawCall?.function?.name || rawCall?.name;
+          const rawArgs = rawCall?.function?.arguments ?? rawCall?.arguments ?? {};
+          if (!name) return;
+          matches.push({
+            id: rawCall?.id || `call_${Date.now()}_${matches.length + index + 1}`,
+            type: 'function',
+            function: {
+              name,
+              arguments: typeof rawArgs === 'string' ? rawArgs : JSON.stringify(rawArgs)
+            }
+          });
+        });
+      } catch {
+        // JSON parse failed, skip
+      }
+    }
+  });
+  return matches;
+}
+
+/**
  * Parse MiMo-style XML function calls:
  *   <function=bash>
  *   <parameter=command>date</parameter>
  *   </function>
- *
- * Returns array of { id, type, function: { name, arguments } }
  */
-function parseMimoXmlFunctionCalls(...chunks) {
+function parseFuncEqBlocks(...chunks) {
   const matches = [];
   chunks.forEach((chunk) => {
     if (!chunk || typeof chunk !== 'string') return;
-
-    // Format 1: <function=NAME><parameter=KEY>VALUE</parameter>...</function>
-    const funcBlocks1 = chunk.matchAll(/<function=(\w+)>([\s\S]*?)<\/function>/g);
-    for (const block of funcBlocks1) {
+    FUNC_EQ_REGEX.lastIndex = 0;
+    const funcBlocks = [...chunk.matchAll(FUNC_EQ_REGEX)];
+    for (const block of funcBlocks) {
       const funcName = block[1];
       const funcBody = block[2];
       if (!funcName) continue;
       const args = {};
-      const paramBlocks = funcBody.matchAll(/<parameter=(\w+)>([\s\S]*?)<\/parameter>/g);
+      PARAM_REGEX.lastIndex = 0;
+      const paramBlocks = [...funcBody.matchAll(PARAM_REGEX)];
       for (const param of paramBlocks) {
         const key = param[1];
         const value = param[2]?.trim() || '';
@@ -46,25 +126,21 @@ function parseMimoXmlFunctionCalls(...chunks) {
       });
     }
 
-    // Format 2: <tool_name>NAME</tool_name><parameters>...</parameters>
-    //   where <parameters> contains <command>VALUE</command> or <KEY>VALUE</KEY>
-    const funcBlocks2 = chunk.matchAll(/<tool_name>(\w+)<\/tool_name>([\s\S]*?)<\/parameters>/g);
+    // Also handle <tool_name>NAME</tool_name><parameters>...</parameters>
+    const funcBlocks2 = [...chunk.matchAll(/<tool_name>(\w+)<\/tool_name>([\s\S]*?)<\/parameters>/g)];
     for (const block of funcBlocks2) {
       const funcName = block[1];
       const funcBody = block[2];
       if (!funcName) continue;
-      // Strip leading <parameters> if present in the match
       const cleanBody = funcBody.replace(/^<parameters>/, '');
       const args = {};
-      // Generic: <anykey>VALUE</anykey>
-      const paramBlocks = cleanBody.matchAll(/<(\w+)>([\s\S]*?)<\/\w+>/g);
+      const paramBlocks = [...cleanBody.matchAll(/<(\w+)>([\s\S]*?)<\/\w+>/g)];
       for (const param of paramBlocks) {
         const key = param[1];
         const value = param[2]?.trim() || '';
         if (key === 'tool_name' || key === 'parameters') continue;
         args[key] = value;
       }
-      // Deduplicate — if same key appears multiple times, keep last
       matches.push({
         id: `call_${funcName}_${Date.now()}_${matches.length + 1}`,
         type: 'function',
@@ -107,20 +183,26 @@ function parseStandardFunctionCalls(...chunks) {
           });
         });
       } catch {
-        // JSON parse failed, skip this block
+        // JSON parse failed, skip
       }
     }
   });
   return matches;
 }
 
+/**
+ * Parse tool calls from text. Tries all 3 formats.
+ */
 export function parseToolCallsFromText(...chunks) {
-  // Try both formats: MiMo XML style AND OpenAI standard <function_calls> style
-  const mimoCalls = parseMimoXmlFunctionCalls(...chunks);
   const standardCalls = parseStandardFunctionCalls(...chunks);
-  return [...mimoCalls, ...standardCalls];
+  const antmlCalls = parseAntmlBlocks(...chunks);
+  const mimoCalls = parseFuncEqBlocks(...chunks);
+  return [...standardCalls, ...antmlCalls, ...mimoCalls];
 }
 
+/**
+ * Parse external tool calls, filtering by registry.
+ */
 export function parseExternalToolCallsFromText(registry, ...chunks) {
   if (!Array.isArray(registry) || registry.length === 0) return [];
   const rawCalls = parseToolCallsFromText(...chunks);
@@ -141,10 +223,15 @@ export function parseExternalToolCallsFromText(registry, ...chunks) {
   });
 }
 
+/**
+ * Create a streaming filter that strips all tool call markup.
+ * State machine handles blocks that span multiple deltas.
+ */
 export function createToolCallFilter({ disableTools, forceStrip = false }) {
   if (!disableTools && !forceStrip) return (chunk) => chunk;
   let inBlock = false;
   let inMimoBlock = false;
+  let inAntmlBlock = false;
   return (chunk) => {
     if (!chunk) return chunk;
     let output = '';
@@ -152,88 +239,140 @@ export function createToolCallFilter({ disableTools, forceStrip = false }) {
     while (remaining.length) {
       if (inBlock) {
         const endIdx = remaining.indexOf('</function_calls>');
-        if (endIdx === -1) {
-          return output;
-        }
+        if (endIdx === -1) return output;
         remaining = remaining.slice(endIdx + '</function_calls>'.length);
         inBlock = false;
         continue;
       }
       if (inMimoBlock) {
         const endIdx = remaining.indexOf('</function>');
-        if (endIdx === -1) {
-          return output;
-        }
+        if (endIdx === -1) return output;
         remaining = remaining.slice(endIdx + '</function>'.length);
         inMimoBlock = false;
         continue;
       }
+      if (inAntmlBlock) {
+        const endIdx = remaining.indexOf(' IMD output...');
+        if (endIdx === -1) return output;
+        remaining = remaining.slice(endIdx + ' IMD output...'.length);
+        inAntmlBlock = false;
+        continue;
+      }
       const startIdxStd = remaining.indexOf('<function_calls>');
       const startIdxMimo = remaining.indexOf('<function=');
-      const firstIdx = startIdxStd === -1 ? startIdxMimo :
-                        startIdxMimo === -1 ? startIdxStd :
-                        Math.min(startIdxStd, startIdxMimo);
-      if (firstIdx === -1) {
+      const startIdxAntml = remaining.indexOf(' IMD output...');
+      const indices = [
+        { idx: startIdxStd, tag: 'std' },
+        { idx: startIdxMimo, tag: 'mimo' },
+        { idx: startIdxAntml, tag: 'antml' }
+      ].filter((e) => e.idx !== -1);
+      if (indices.length === 0) {
         output += remaining;
         return output;
       }
-      output += remaining.slice(0, firstIdx);
-      if (firstIdx === startIdxStd) {
-        remaining = remaining.slice(firstIdx + '<function_calls>'.length);
+      const first = indices.sort((a, b) => a.idx - b.idx)[0];
+      output += remaining.slice(0, first.idx);
+      if (first.tag === 'std') {
+        remaining = remaining.slice(first.idx + '<function_calls>'.length);
         inBlock = true;
-      } else {
-        remaining = remaining.slice(firstIdx);
+      } else if (first.tag === 'mimo') {
+        remaining = remaining.slice(first.idx);
         inMimoBlock = true;
+      } else {
+        remaining = remaining.slice(first.idx + ' IMD output...'.length);
+        inAntmlBlock = true;
       }
     }
     return output;
   };
 }
 
+/**
+ * Create a streaming parser for external tool calls.
+ * Handles all 3 MiMo formats with tag-aware buffer truncation.
+ * Buffer is 8192 chars — never truncate past an unclosed opening tag.
+ */
 export function createExternalToolCallStreamParser(registry) {
   if (!Array.isArray(registry) || registry.length === 0) {
     return () => [];
   }
-  const openTagStd = '<function_calls>';
-  const closeTagStd = '</function_calls>';
   let buffer = '';
   return (chunk) => {
     if (!chunk) return [];
     buffer += chunk;
     const parsedCalls = [];
 
-    // Parse standard <function_calls>...</function_calls> blocks
     while (buffer.length) {
-      const startIdx = buffer.indexOf(openTagStd);
-      const mimoStart = buffer.indexOf('<function=');
-      const firstIdx = startIdx === -1 ? mimoStart :
-                        mimoStart === -1 ? startIdx :
-                        Math.min(startIdx, mimoStart);
-      if (firstIdx === -1) {
-        buffer = buffer.slice(-(Math.max(openTagStd.length, 10) - 1));
+      // Find the earliest opening tag
+      const startIdxStd = buffer.indexOf('<function_calls>');
+      const startIdxMimo = buffer.indexOf('<function=');
+      const startIdxAntml = buffer.indexOf(' IMD output...');
+
+      const indices = [
+        { idx: startIdxStd, tag: 'std', openTag: '<function_calls>', closeTag: '</function_calls>' },
+        { idx: startIdxMimo, tag: 'mimo', openTag: '<function=', closeTag: '</function>' },
+        { idx: startIdxAntml, tag: 'antml', openTag: ' IMD output...', closeTag: ' IMD output...' }
+      ].filter((e) => e.idx !== -1);
+
+      if (indices.length === 0) {
+        // No opening tag found — keep tail that could be start of a tag
+        const maxTagLen = Math.max(
+          '<function_calls>'.length,
+          '<function='.length,
+          ' IMD output...'.length
+        ) - 1;
+        if (buffer.length > maxTagLen) {
+          buffer = buffer.slice(-maxTagLen);
+        }
         break;
       }
 
-      if (firstIdx === startIdx) {
-        // Standard format
-        const endIdx = buffer.indexOf(closeTagStd, startIdx + openTagStd.length);
+      const first = indices.sort((a, b) => a.idx - b.idx)[0];
+
+      if (first.tag === 'std') {
+        // Standard format: <function_calls>...</function_calls>
+        const endIdx = buffer.indexOf(first.closeTag, first.idx + first.openTag.length);
         if (endIdx === -1) {
-          buffer = buffer.slice(startIdx);
+          // Block not complete yet — keep from opening tag, but check buffer size
+          if (buffer.length - first.idx > MAX_BUFFER) {
+            // Buffer overflow — discard this incomplete block
+            buffer = buffer.slice(first.idx + first.openTag.length);
+          } else {
+            buffer = buffer.slice(first.idx);
+          }
           break;
         }
-        const block = buffer.slice(startIdx, endIdx + closeTagStd.length);
+        const block = buffer.slice(first.idx, endIdx + first.closeTag.length);
         parsedCalls.push(...parseExternalToolCallsFromText(registry, block));
-        buffer = buffer.slice(endIdx + closeTagStd.length);
-      } else {
+        buffer = buffer.slice(endIdx + first.closeTag.length);
+      } else if (first.tag === 'mimo') {
         // MiMo XML format: <function=NAME>...</function>
-        const funcMatch = buffer.slice(firstIdx).match(/<function=(\w+)>[\s\S]*?<\/function>/);
-        if (!funcMatch) {
-          buffer = buffer.slice(firstIdx);
+        const endIdx = buffer.indexOf(first.closeTag, first.idx + first.openTag.length);
+        if (endIdx === -1) {
+          if (buffer.length - first.idx > MAX_BUFFER) {
+            buffer = buffer.slice(first.idx + first.openTag.length);
+          } else {
+            buffer = buffer.slice(first.idx);
+          }
           break;
         }
-        const fullBlock = funcMatch[0];
-        parsedCalls.push(...parseExternalToolCallsFromText(registry, fullBlock));
-        buffer = buffer.slice(firstIdx + fullBlock.length);
+        const block = buffer.slice(first.idx, endIdx + first.closeTag.length);
+        parsedCalls.push(...parseExternalToolCallsFromText(registry, block));
+        buffer = buffer.slice(endIdx + first.closeTag.length);
+      } else {
+        //  IMD output... JSON  IMD output...
+        const endIdx = buffer.indexOf(first.closeTag, first.idx + first.openTag.length);
+        if (endIdx === -1) {
+          if (buffer.length - first.idx > MAX_BUFFER) {
+            buffer = buffer.slice(first.idx + first.openTag.length);
+          } else {
+            buffer = buffer.slice(first.idx);
+          }
+          break;
+        }
+        const block = buffer.slice(first.idx, endIdx + first.closeTag.length);
+        parsedCalls.push(...parseExternalToolCallsFromText(registry, block));
+        buffer = buffer.slice(endIdx + first.closeTag.length);
       }
     }
     return parsedCalls;

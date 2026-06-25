@@ -14,6 +14,7 @@ import { evaluateToolPolicy } from './tool-runtime/policy.js';
 import { validateToolCalls } from './tool-runtime/validator.js';
 import {
     stripFunctionCallMarkup,
+    stripToolMarkupText,
     parseExternalToolCallsFromText,
     createToolCallFilter,
     createExternalToolCallStreamParser
@@ -69,7 +70,7 @@ const STARTING_WAIT_ITERATIONS = 120;
 const STARTING_WAIT_INTERVAL_MS = 1000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 300000;
 const DEFAULT_POLL_INTERVAL_MS = 500;
-const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 4000;
+const DEFAULT_EVENT_FIRST_DELTA_TIMEOUT_MS = 30000;
 const DEFAULT_EVENT_IDLE_TIMEOUT_MS = 8000;
 
 const MIMOCODE_BASENAME = 'mimo';
@@ -476,7 +477,7 @@ export function createApp(config) {
     });
 
     const TOOL_GUARD_MESSAGE = 'Tools are disabled. Do not call tools or function calls. Answer directly from the conversation and general knowledge. If external or real-time data is required, say so and ask the user to enable tools.';
-    const EXTERNAL_TOOL_GUARD_MESSAGE = 'OpenCode internal tools remain disabled. If an external tool contract is present, use only that contract and never call or mention OpenCode internal tools.';
+    // EXTERNAL_TOOL_GUARD_MESSAGE removed — buildSystemPrompt is now pure pass-through
 
     const normalizeConfiguredToolNames = (entries = []) => [...new Set(
         entries
@@ -500,21 +501,28 @@ export function createApp(config) {
         return 'OpenCode internal tools are unavailable for this turn. Answer directly without attempting tool usage.';
     };
 
-    const buildSystemPrompt = (systemMsg, reasoningEffort = null, toolMode = TOOL_MODE.DISABLED, internalAllowedTools = [], hasToolResults = false) => {
+    const buildSystemPrompt = (systemMsg, reasoningEffort = null, toolMode = TOOL_MODE.DISABLED, internalAllowedTools = [], hasToolResults = false, externalToolPrompt = '') => {
         const parts = [];
+        // Pure pass-through: preserve Hermes system prompt as-is
         if (!OMIT_SYSTEM_PROMPT && systemMsg && systemMsg.trim()) {
             parts.push(systemMsg.trim());
         }
         if (reasoningEffort && reasoningEffort !== 'none') {
             parts.push(`[Reasoning Effort: ${reasoningEffort}]`);
         }
+        // Add external tool prompt (tool format instructions)
+        if (externalToolPrompt) {
+            parts.push(externalToolPrompt);
+        }
+        // Guide model when tool results are present
         if (hasToolResults) {
             parts.push('The tool results have been received. Now synthesize a final response for the user based on these results. Do NOT call any more tools.');
         } else if (toolMode === TOOL_MODE.INTERNAL_ALLOWLIST) {
             parts.push(buildInternalAllowlistPrompt(internalAllowedTools));
-        } else if (DISABLE_TOOLS && PROMPT_MODE !== 'plugin-inject') {
-            parts.push(toolMode === TOOL_MODE.EXTERNAL_BRIDGE ? EXTERNAL_TOOL_GUARD_MESSAGE : TOOL_GUARD_MESSAGE);
+        } else if (DISABLE_TOOLS && toolMode === TOOL_MODE.DISABLED && PROMPT_MODE !== 'plugin-inject') {
+            parts.push(TOOL_GUARD_MESSAGE);
         }
+        // No EXTERNAL_TOOL_GUARD_MESSAGE — external tool contract is in externalToolPrompt
         const finalPrompt = parts.join('\n\n').trim();
         return finalPrompt || undefined;
     };
@@ -998,6 +1006,25 @@ export function createApp(config) {
         throw new Error(`Request timeout after ${timeoutMs}ms`);
     }
 
+    async function pollForResponseWithRetry(sessionId, timeoutMs, maxRetries = 3) {
+        const delays = [2000, 4000, 8000];
+        for (let attempt = 0; attempt < maxRetries; attempt++) {
+            try {
+                const result = await pollForAssistantResponse(sessionId, timeoutMs);
+                if (result && (result.content || result.reasoning)) {
+                    return result;
+                }
+                logDebug('Empty poll result, retrying', { sessionId, attempt: attempt + 1, delay: delays[attempt] });
+            } catch (e) {
+                logDebug('Poll error, retrying', { sessionId, attempt: attempt + 1, error: e.message, delay: delays[attempt] });
+            }
+            if (attempt < maxRetries - 1) {
+                await sleep(delays[attempt]);
+            }
+        }
+        return { content: '', reasoning: '', error: null };
+    }
+
     async function collectFromEvents(sessionId, timeoutMs, onDelta, firstDeltaTimeoutMs, idleTimeoutMs) {
         const controller = new AbortController();
         const eventStreamResult = await client.event.subscribe({ signal: controller.signal });
@@ -1124,7 +1151,6 @@ export function createApp(config) {
                 let pID = 'mimo';
                 let mID = 'kimi-k2.5-free';
                 let id = `chatcmpl-${Date.now()}`;
-                let insideReasoning = false;
                 let keepaliveInterval = null;
 
                 try {
@@ -1294,11 +1320,12 @@ export function createApp(config) {
                         });
                     }
                     const systemWithGuard = buildSystemPrompt(
-                        [systemMsg, externalToolContext.prompt].filter(Boolean).join('\n\n'),
+                        systemMsg,
                         requestParams.reasoning_effort,
                         toolMode,
                         internalToolContext.allowedToolNames,
-                        hasToolResults
+                        hasToolResults,
+                        externalToolContext.prompt
                     );
                     if (!parts.length) {
                         return res.status(400).json({ error: { message: 'messages must include at least one non-system text message' } });
@@ -1340,7 +1367,6 @@ export function createApp(config) {
                     logDebug('Session created', { sessionId });
 
                     id = `chatcmpl-${Date.now()}`;
-                    insideReasoning = false;
                     keepaliveInterval = null;
                     let completionTokens = 0;
                     let reasoningTokens = 0;
@@ -1389,7 +1415,6 @@ export function createApp(config) {
                         let rawStreamedContent = '';
                         let rawStreamedReasoning = '';
                         const streamedToolCalls = [];
-                        insideReasoning = false;
                         keepaliveInterval = null;
                         completionTokens = 0;
                         reasoningTokens = 0;
@@ -1405,10 +1430,15 @@ export function createApp(config) {
                         };
                         ensureKeepalive();
 
+                        // Phase-aware sendDelta:
+                        // - Tool phase (externalToolRegistry.length > 0): extract tool calls, suppress reasoning text
+                        // - Response phase (no tools): send reasoning as normal content for visibility
                         const sendDelta = (delta, isReasoning = false) => {
                             if (!delta) return;
                             if (isReasoning) rawStreamedReasoning += delta;
                             else rawStreamedContent += delta;
+
+                            // Parse tool calls from delta
                             const parsedDeltaToolCalls = isReasoning
                                 ? parseReasoningToolCalls(delta)
                                 : parseContentToolCalls(delta);
@@ -1436,51 +1466,40 @@ export function createApp(config) {
                                     }]
                                 })}\n\n`);
                             });
+
+                            // Phase-aware: during tool-calling phase, suppress reasoning
+                            if (externalToolRegistry.length > 0 && isReasoning) {
+                                // Tool phase: reasoning is suppressed (only tool calls extracted above)
+                                return;
+                            }
+
                             const filtered = isReasoning ? filterReasoningDelta(delta) : filterContentDelta(delta);
                             if (!filtered) return;
+
+                            // During response phase, send reasoning as normal content
                             if (isReasoning) {
-                                if (!insideReasoning) {
-                                    res.write(`data: ${JSON.stringify({
-                                        id,
-                                        object: 'chat.completion.chunk',
-                                        created: Math.floor(Date.now() / 1000),
-                                        model: `${pID}/${mID}`,
-                                        choices: [{
-                                            index: 0,
-                                            delta: { content: '<think>\n' },
-                                            finish_reason: null
-                                        }]
-                                    })}\n\n`);
-                                    insideReasoning = true;
-                                }
                                 streamedReasoning += filtered;
                                 reasoningTokens += Math.ceil(filtered.length / 4);
+                                // Send reasoning as content (response phase)
+                                res.write(`data: ${JSON.stringify({
+                                    id,
+                                    object: 'chat.completion.chunk',
+                                    created: Math.floor(Date.now() / 1000),
+                                    model: `${pID}/${mID}`,
+                                    choices: [{ index: 0, delta: { content: filtered }, finish_reason: null }]
+                                })}\n\n`);
                             } else {
-                                if (insideReasoning) {
-                                    res.write(`data: ${JSON.stringify({
-                                        id,
-                                        object: 'chat.completion.chunk',
-                                        created: Math.floor(Date.now() / 1000),
-                                        model: `${pID}/${mID}`,
-                                        choices: [{
-                                            index: 0,
-                                            delta: { content: '\n</think>\n\n' },
-                                            finish_reason: null
-                                        }]
-                                    })}\n\n`);
-                                    insideReasoning = false;
-                                }
                                 streamedContent += filtered;
                                 completionTokens += Math.ceil(filtered.length / 4);
+                                const chunk = {
+                                    id,
+                                    object: 'chat.completion.chunk',
+                                    created: Math.floor(Date.now() / 1000),
+                                    model: `${pID}/${mID}`,
+                                    choices: [{ index: 0, delta: { content: filtered }, finish_reason: null }]
+                                };
+                                res.write(`data: ${JSON.stringify(chunk)}\n\n`);
                             }
-                            const chunk = {
-                                id,
-                                object: 'chat.completion.chunk',
-                                created: Math.floor(Date.now() / 1000),
-                                model: `${pID}/${mID}`,
-                                choices: [{ index: 0, delta: { content: filtered }, finish_reason: null }]
-                            };
-                            res.write(`data: ${JSON.stringify(chunk)}\n\n`);
                         };
 
                         let collected = null;
@@ -1504,45 +1523,30 @@ export function createApp(config) {
                                 sessionId,
                                 error: collected.__error?.message
                             });
-                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            const { content, reasoning, error } = await pollForResponseWithRetry(sessionId, REQUEST_TIMEOUT_MS);
                             if (error && !content && !reasoning) {
                                 sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
                             } else if (reasoning && !content) {
-                                if (insideReasoning) {
-                                    res.write(`data: ${JSON.stringify({
-                                        id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
-                                        model: `${pID}/${mID}`,
-                                        choices: [{ index: 0, delta: { content: '\n</think>\n\n' }, finish_reason: null }]
-                                    })}\n\n`);
-                                    insideReasoning = false;
-                                }
-                                sendDelta(reasoning, false);
+                                // Reasoning-only: send via sendDelta with isReasoning=true for tool extraction
+                                sendDelta(reasoning, true);
                             } else {
                                 if (reasoning) sendDelta(reasoning, true);
                                 if (content) sendDelta(content, false);
                             }
                         } else if (collected && collected.noData) {
                             logDebug('Fallback to polling (stream)', { sessionId });
-                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            const { content, reasoning, error } = await pollForResponseWithRetry(sessionId, REQUEST_TIMEOUT_MS);
                             if (error && !content && !reasoning) {
                                 sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
                             } else if (reasoning && !content) {
-                                if (insideReasoning) {
-                                    res.write(`data: ${JSON.stringify({
-                                        id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
-                                        model: `${pID}/${mID}`,
-                                        choices: [{ index: 0, delta: { content: '\n</think>\n\n' }, finish_reason: null }]
-                                    })}\n\n`);
-                                    insideReasoning = false;
-                                }
-                                sendDelta(reasoning, false);
+                                sendDelta(reasoning, true);
                             } else {
                                 if (reasoning) sendDelta(reasoning, true);
                                 if (content) sendDelta(content, false);
                             }
                         } else if (collected && collected.idleTimeout) {
                             logDebug('SSE idle timeout, polling for completion', { sessionId });
-                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            const { content, reasoning, error } = await pollForResponseWithRetry(sessionId, REQUEST_TIMEOUT_MS);
                             if (error && !content && !reasoning) {
                                 sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
                             } else {
@@ -1553,16 +1557,7 @@ export function createApp(config) {
                                     ? content.slice(rawStreamedContent.length)
                                     : content;
                                 if (remainingReasoning && !remainingContent && !streamedContent) {
-                                    // Reasoning-only response: close think and send reasoning as content
-                                    if (insideReasoning) {
-                                        res.write(`data: ${JSON.stringify({
-                                            id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
-                                            model: `${pID}/${mID}`,
-                                            choices: [{ index: 0, delta: { content: '\n</think>\n\n' }, finish_reason: null }]
-                                        })}\n\n`);
-                                        insideReasoning = false;
-                                    }
-                                    sendDelta(remainingReasoning, false);
+                                    sendDelta(remainingReasoning, true);
                                 } else {
                                     if (remainingReasoning) sendDelta(remainingReasoning, true);
                                     if (remainingContent) sendDelta(remainingContent, false);
@@ -1577,39 +1572,18 @@ export function createApp(config) {
 
                         if (!streamedContent && !streamedReasoning) {
                             logDebug('SSE returned empty, falling back to polling', { sessionId });
-                            const { content, reasoning, error } = await pollForAssistantResponse(sessionId, REQUEST_TIMEOUT_MS);
+                            const { content, reasoning, error } = await pollForResponseWithRetry(sessionId, REQUEST_TIMEOUT_MS);
                             if (error && !content && !reasoning) {
                                 sendDelta(`[Proxy Error] ${error.name || 'OpenCodeError'}: ${error.data?.message || error.message || 'Unknown error'}`);
                             } else if (reasoning && !content) {
-                                // Model produced reasoning but no content — send reasoning as content directly
-                                if (insideReasoning) {
-                                    res.write(`data: ${JSON.stringify({
-                                        id, object: 'chat.completion.chunk', created: Math.floor(Date.now() / 1000),
-                                        model: `${pID}/${mID}`,
-                                        choices: [{ index: 0, delta: { content: '\n</think>\n\n' }, finish_reason: null }]
-                                    })}\n\n`);
-                                    insideReasoning = false;
-                                }
-                                sendDelta(reasoning, false);
+                                sendDelta(reasoning, true);
                             } else {
                                 if (reasoning) sendDelta(reasoning, true);
                                 if (content) sendDelta(content, false);
                             }
                         }
 
-                        if (insideReasoning) {
-                            res.write(`data: ${JSON.stringify({
-                                id,
-                                object: 'chat.completion.chunk',
-                                created: Math.floor(Date.now() / 1000),
-                                model: `${pID}/${mID}`,
-                                choices: [{
-                                    index: 0,
-                                    delta: { content: '\n</think>\n\n' },
-                                    finish_reason: null
-                                }]
-                            })}\n\n`);
-                        }
+                        // No insideReasoning close block — thinking markers are not injected
 
                         let parsedToolCalls = streamedToolCalls.length > 0
                             ? streamedToolCalls
@@ -1695,8 +1669,8 @@ export function createApp(config) {
                             }
                         }
                         const { validCalls: validatedToolCalls } = finalizeValidatedToolCalls(parsedToolCalls, externalToolRegistry);
-                        const safeContent = stripFunctionCallMarkup(stripFunctionCalls(content));
-                        const safeReasoning = stripFunctionCallMarkup(stripFunctionCalls(reasoning));
+                        const safeContent = stripToolMarkupText(stripFunctionCalls(content));
+                        const safeReasoning = stripToolMarkupText(stripFunctionCalls(reasoning));
 
                         const promptTokens = Math.ceil((fullPromptText || '').length / 4);
                         const completionTokensCalc = Math.ceil((content || '').length / 4);
@@ -1706,7 +1680,8 @@ export function createApp(config) {
                         let finalContent = safeContent;
                         if (safeReasoning) {
                             if (safeContent) {
-                                finalContent = `<think>\n${safeReasoning}\n</think>\n\n${safeContent}`;
+                                // Both reasoning and content: send reasoning first, then content
+                                finalContent = `${safeReasoning}\n\n${safeContent}`;
                             } else {
                                 // Model produced reasoning but no content — use reasoning as fallback content
                                 finalContent = safeReasoning;
@@ -1745,20 +1720,6 @@ export function createApp(config) {
                 } catch (error) {
                     console.error('[Proxy] API Error:', error.message);
                     console.error('[Proxy] Error details:', error);
-
-                    if (stream && typeof insideReasoning !== 'undefined' && insideReasoning) {
-                        res.write(`data: ${JSON.stringify({
-                            id,
-                            object: 'chat.completion.chunk',
-                            created: Math.floor(Date.now() / 1000),
-                            model: `${pID}/${mID}`,
-                            choices: [{
-                                index: 0,
-                                delta: { content: '\n\n' },
-                                finish_reason: null
-                            }]
-                        })}\n\n`);
-                    }
 
                     if (keepaliveInterval) clearInterval(keepaliveInterval);
 
@@ -2087,11 +2048,12 @@ export function createApp(config) {
             }
 
             const systemWithGuard = buildSystemPrompt(
-                [instructions, ...systemChunks, externalToolContext.prompt].filter(Boolean).join('\n\n'),
+                [instructions, ...systemChunks].filter(Boolean).join('\n\n'),
                 reasoningLevel,
                 toolMode,
                 internalToolContext.allowedToolNames,
-                false
+                false,
+                externalToolContext.prompt
             );
 
             const requestForcedResponsesToolCall = createForcedToolCallRequester({
